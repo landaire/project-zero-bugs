@@ -4,16 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+twitter-v2 = { version = "0.1.8", default-features = false, features = [
+    "rustls-tls",
+] }
 anyhow = "1.0.82"
 bytes = "1.6.0"
 clap = { version = "4.5.4", features = ["derive"] }
 dotenv = "0.15.0"
 feed-rs = "1.4.0"
 regex = "1.10.4"
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = [
+    "http2",
+    "gzip",
+    "brotli",
+    "deflate",
+    "rustls-tls",
+] }
 serde = { version = "1.0.198", features = ["derive"] }
 serde_json = "1.0.116"
 tokio = { version = "1.37", features = ["full"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3"
-twitter-v2 = "0.1.8"

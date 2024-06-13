@@ -17,17 +17,28 @@ pub async fn fetch_blog_posts() -> anyhow::Result<()> {
     let feed_text = reqwest::get(BLOGS_FEED).await?.bytes().await?.to_vec();
     let feed = feed_rs::parser::parse(feed_text.as_slice())?;
     for item in &feed.entries {
-        let mut config = config::get().lock().unwrap();
+        let config = config::get().lock().unwrap();
         if config.is_blog_posted(item.id.as_str()) {
             break;
         }
+        drop(config);
 
         // TODO: should account for max tweet length, but too lazy to
         // properly calculate
         if let Some(title) = item.title.as_ref().map(|c| c.content.as_str()) {
-            let tweet = format!("{} {}", title, item.links.first().unwrap().href.as_str());
-            post_tweet(tweet).await?;
-            config.add_posted_blog(item.id.clone());
+            let link = item.links.iter().find(|link| {
+                link.rel
+                    .as_ref()
+                    .map(|rel| rel == "alternate")
+                    .unwrap_or_default()
+            });
+            if let Some(link) = link {
+                let tweet = format!("{} {}", title, link.href.as_str());
+                post_tweet(tweet).await?;
+
+                let mut config = config::get().lock().unwrap();
+                config.add_posted_blog(item.id.clone());
+            }
         }
     }
 

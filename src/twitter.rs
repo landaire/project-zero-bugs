@@ -24,11 +24,6 @@ pub async fn post_tweet(text: String) -> anyhow::Result<()> {
         );
 
         let api = TwitterApi::new(auth);
-        info!(
-            "attempting to get user info {:?}",
-            api.get_users_by_usernames(["landaire"]).send().await
-        );
-
         api.post_tweet().text(text).send().await?;
     }
 
