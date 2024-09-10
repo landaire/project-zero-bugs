@@ -2,7 +2,7 @@ use bytes::Buf;
 use regex::Regex;
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::task::JoinSet;
 use tracing::error;
 
@@ -10,8 +10,8 @@ use crate::config;
 use crate::twitter::post_tweet;
 
 const BLOGS_FEED: &str = "https://googleprojectzero.blogspot.com/feeds/posts/default";
-const ISSUE_BOARD_URL: &str = "https://bugs.chromium.org/prpc/monorail.Issues/ListIssues";
-const UNIQUE_ISSUE_URL: &str = "https://bugs.chromium.org/p/project-zero/issues/detail?id=";
+const ISSUE_BOARD_URL: &str = "https://project-zero.issues.chromium.org/action/issues/list";
+const UNIQUE_ISSUE_URL: &str = "https://project-zero.issues.chromium.org/issues/";
 
 pub async fn fetch_blog_posts() -> anyhow::Result<()> {
     let feed_text = reqwest::get(BLOGS_FEED).await?.bytes().await?.to_vec();
@@ -45,54 +45,32 @@ pub async fn fetch_blog_posts() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn get_srf_token() -> anyhow::Result<Option<String>> {
-    let list_page_text =
-        reqwest::get("https://bugs.chromium.org/p/project-zero/issues/list?q=&can=1&mode=grid")
-            .await?
-            .text()
-            .await?;
-
-    let re = Regex::new("'token': '(?P<token>[^']+)',").expect("failed to compile regex");
-
-    let caps = re.captures(&list_page_text);
-    if let Some(caps) = caps {
-        Ok(Some(caps["token"].to_string()))
-    } else {
-        Ok(None)
-    }
-}
+pub type IssuesResponse = Vec<(
+    String,
+    Value,
+    Value,
+    Value,
+    Value,
+    Value,
+    (Vec<Vec<Value>>, String, i64),
+)>;
 
 pub async fn fetch_bug_disclosures() -> anyhow::Result<()> {
-    let srf_token = get_srf_token().await?;
-    if srf_token.is_none() {
-        error!("Did not receive a valid SRF token");
-        return Ok(());
-    }
-
-    let srf_token = srf_token.unwrap();
-
-    let mut total_items = 1;
     let mut posted_items = 0;
     let client = reqwest::Client::new();
     let mut join_set = JoinSet::new();
+    let mut requests = 0;
 
-    while posted_items <= total_items {
-        let body = json!({
-            "projectNames":["project-zero"],
-            "query":"",
-            "cannedQuery":1,
-            "groupBySpec":"",
-            "sortSpec":"",
-            "pagination":   {
-                "start": posted_items,
-                "maxItems":500
-            }
-        });
+    const ISSUE_QUERY_COUNT: usize = 50;
+
+    while requests < 10 {
+        let body = json!(
+            [null,null,null,null,null,["365"],["status:(open | new | assigned | accepted | closed | fixed | verified | duplicate | infeasible | intended_behavior | not_reproducible | obsolete)",null,ISSUE_QUERY_COUNT,format!("start_index:{}", posted_items)]]
+        );
         let res = client
             .post(ISSUE_BOARD_URL)
             .header(ACCEPT, "application/json")
             .header(CONTENT_TYPE, "application/json")
-            .header("X-Xsrf-Token", srf_token.as_str())
             .body(body.to_string())
             .send()
             .await?;
@@ -105,24 +83,50 @@ pub async fn fetch_bug_disclosures() -> anyhow::Result<()> {
         }
         let issues_response = issues_response?;
 
-        total_items = issues_response.total_results;
-
         let mut config = config::get().lock().unwrap();
-        if let Some(issues) = issues_response.issues.as_ref() {
-            for issue in issues {
-                posted_items += 1;
-                if config.is_bug_posted(issue.local_id) {
-                    continue;
-                }
-                config.add_posted_bug(issue.local_id);
-                join_set.spawn(post_tweet(format!(
-                    "{} {}{}",
-                    issue.summary, UNIQUE_ISSUE_URL, issue.local_id
-                )));
+
+        // The issues are stored in [0][last][0]
+        let issues = &issues_response
+            .first()
+            .ok_or(anyhow::format_err!("issues_response has no 0 element"))?
+            .6
+             .0;
+
+        for issue in issues {
+            posted_items += 1;
+            let issue_id = issue
+                .get(1)
+                .ok_or(anyhow::format_err!("issue has no ID field (idx 1)"))?
+                .as_i64()
+                .ok_or(anyhow::format_err!("issue ID is not a number"))?;
+            if config.is_bug_posted(issue_id) {
+                continue;
             }
-        } else {
+
+            let issue_summary = issue
+                .get(2)
+                .ok_or(anyhow::format_err!("issue has no metadata (idx 2)"))?
+                .as_array()
+                .ok_or(anyhow::format_err!("issue metadata is not an array"))?
+                .get(5)
+                .ok_or(anyhow::format_err!(
+                    "metadata does not have a title (5th element)"
+                ))?
+                .as_str()
+                .ok_or(anyhow::format_err!("issue title is not a string"))?;
+
+            config.add_posted_bug(issue_id);
+            join_set.spawn(post_tweet(format!(
+                "{} {}{}",
+                issue_summary, UNIQUE_ISSUE_URL, issue_id
+            )));
+        }
+
+        if issues.len() < ISSUE_QUERY_COUNT {
             break;
         }
+
+        requests += 1;
     }
 
     while let Some(res) = join_set.join_next().await {
@@ -132,77 +136,4 @@ pub async fn fetch_bug_disclosures() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-// The following was generated with https://transform.tools/json-to-rust-serde
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IssuesResponse {
-    pub issues: Option<Vec<Issue>>,
-    pub total_results: i64,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Issue {
-    pub project_name: String,
-    pub local_id: i64,
-    pub summary: String,
-    pub status_ref: StatusRef,
-    pub owner_ref: OwnerRef,
-    pub label_refs: Option<Vec<LabelRef>>,
-    pub reporter_ref: ReporterRef,
-    pub opened_timestamp: i64,
-    pub closed_timestamp: Option<i64>,
-    pub modified_timestamp: i64,
-    // pub star_count: Option<i64>,
-    // pub attachment_count: Option<i64>,
-    // pub component_modified_timestamp: i64,
-    // pub status_modified_timestamp: i64,
-    // pub owner_modified_timestamp: i64,
-    // #[serde(default)]
-    // pub cc_refs: Vec<CcRef>,
-    // pub merged_into_issue_ref: Option<MergedIntoIssueRef>,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusRef {
-    pub status: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnerRef {
-    pub user_id: String,
-    pub display_name: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LabelRef {
-    pub label: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReporterRef {
-    pub user_id: String,
-    pub display_name: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CcRef {
-    pub user_id: String,
-    pub display_name: String,
-    pub is_derived: Option<bool>,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MergedIntoIssueRef {
-    pub project_name: String,
-    pub local_id: i64,
 }
